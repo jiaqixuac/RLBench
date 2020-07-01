@@ -90,3 +90,9 @@ class ObservationConfig(object):
         self.gripper_joint_positions = value
         self.gripper_touch_forces = value
         self.task_low_dim_state = value
+
+    def set_wrist_only_high_dim(self):
+        self.left_shoulder_camera.set_all(False)
+        self.right_shoulder_camera.set_all(False)
+        self.wrist_camera.set_all(True)
+        self.front_camera.set_all(False)

@@ -1,7 +1,7 @@
 import os
 import re
 from os.path import dirname, abspath, join
-from typing import List, Tuple, Callable
+from typing import List, Tuple, Dict, Callable
 
 import numpy as np
 from pyrep import PyRep
@@ -378,3 +378,9 @@ class Task(object):
         for func, way in additional_waypoint_inits:
             func(way)
         return waypoints
+
+    def compute_reward(self, achieved_goal: np.ndarray, desired_goal: np.ndarray, info):
+        raise NotImplementedError
+
+    def is_success(self, achieved_goal: np.ndarray, desired_goal: np.ndarray):
+        raise NotImplementedError

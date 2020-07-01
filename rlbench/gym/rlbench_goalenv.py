@@ -11,11 +11,6 @@ from rlbench.observation_config import ObservationConfig
 import numpy as np
 
 
-def goal_distance(goal_a, goal_b):
-    assert goal_a.shape == goal_b.shape
-    return np.linalg.norm(goal_a - goal_b, axis=-1)
-
-
 class RLBenchGoalEnv(gym.GoalEnv):
     """An gym goal wrapper for RLBench."""
 
@@ -45,6 +40,7 @@ class RLBenchGoalEnv(gym.GoalEnv):
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(self.env.action_size,))
 
+        # achieved_goal, desired_goal are from task decorate_observation()
         if observation_mode == 'state':
             self.observation_space = spaces.Dict({
                 'observation': spaces.Box(
@@ -82,19 +78,19 @@ class RLBenchGoalEnv(gym.GoalEnv):
                     low=-np.inf, high=np.inf,
                     shape=obs.desired_goal.shape),
                 })
-        self.distance_threshold = 0.05
 
         if render_mode is not None:
             # Add the camera to the scene
             cam_placeholder = Dummy('cam_cinematic_placeholder')
             self._gym_cam = VisionSensor.create([640, 360])
             self._gym_cam.set_pose(cam_placeholder.get_pose())
-            self._gym_cam_wrist = VisionSensor.create([360, 360])
-            self._gym_cam_wrist_placeholder = Dummy('cam_wrist_placeholder')
             if render_mode == 'human':
                 self._gym_cam.set_render_mode(RenderMode.OPENGL3_WINDOWED)
             else:
                 self._gym_cam.set_render_mode(RenderMode.OPENGL3)
+                self._gym_cam_wrist = VisionSensor.create([360, 360])
+                self._gym_cam_wrist_placeholder = Dummy('cam_wrist_placeholder')
+                self._gym_cam_wrist.set_render_mode(RenderMode.OPENGL3)
 
     def _extract_obs(self, obs) -> Dict[str, np.ndarray]:
         if self._observation_mode == 'state':
@@ -154,10 +150,8 @@ class RLBenchGoalEnv(gym.GoalEnv):
     def close(self) -> None:
         self.env.shutdown()
 
-    def compute_reward(self, achieved_goal, desired_goal, info):
-        d = goal_distance(achieved_goal, desired_goal)
-        return -(d > self.distance_threshold).astype(np.float32)
+    def compute_reward(self, achieved_goal: np.ndarray, desired_goal: np.ndarray, info):
+        return self.task.compute_reward(achieved_goal, desired_goal, info)
 
-    def _is_success(self, achieved_goal, desired_goal):
-        d = goal_distance(achieved_goal, desired_goal)
-        return (d < self.distance_threshold).astype(np.float32)
+    def _is_success(self, achieved_goal: np.ndarray, desired_goal: np.ndarray):
+        return self.task.is_success(achieved_goal, desired_goal)

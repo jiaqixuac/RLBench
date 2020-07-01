@@ -1,5 +1,5 @@
 import logging
-from typing import List, Callable
+from typing import List, Dict, Callable
 
 import numpy as np
 from pyquaternion import Quaternion
@@ -351,3 +351,9 @@ class TaskEnvironment(object):
     def reset_to_demo(self, demo: Demo) -> None:
         demo.restore_state()
         self.reset()
+
+    def compute_reward(self, achieved_goal: np.ndarray, desired_goal: np.ndarray, info):
+        return self._task.compute_reward(achieved_goal, desired_goal, info)
+
+    def is_success(self, achieved_goal: np.ndarray, desired_goal: np.ndarray):
+        return self._task.is_success(achieved_goal, desired_goal)

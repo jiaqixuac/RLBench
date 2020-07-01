@@ -11,12 +11,7 @@ from rlbench.observation_config import ObservationConfig
 import numpy as np
 
 
-def goal_distance(goal_a, goal_b):
-    assert goal_a.shape == goal_b.shape
-    return np.linalg.norm(goal_a - goal_b, axis=-1)
-
-
-class RLBenchDvrkEnv(gym.Env):
+class RLBenchDvrkEnv(gym.GoalEnv):
     """An gym dvrk wrapper for RLBench."""
 
     metadata = {'render.modes': ['human', 'rgb_array']}
@@ -27,10 +22,13 @@ class RLBenchDvrkEnv(gym.Env):
         self._render_mode = render_mode
         obs_config = ObservationConfig()
         if observation_mode == 'state':
-            obs_config.set_all_high_dim(False)
+            # obs_config.set_all_high_dim(False)
             obs_config.set_all_low_dim(True)
+            obs_config.set_wrist_only_high_dim()
         elif observation_mode == 'vision':
-            obs_config.set_all(True)
+            obs_config.set_all_low_dim(True)
+            # only use the wrist camera
+            obs_config.set_wrist_only_high_dim()
         else:
             raise ValueError(
                 'Unrecognised observation_mode: %s.' % observation_mode)
@@ -45,6 +43,7 @@ class RLBenchDvrkEnv(gym.Env):
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(self.env.action_size,))
 
+        # achieved_goal, desired_goal, robot_low_dim_data are from task decorate_observation()
         if observation_mode == 'state':
             self.observation_space = spaces.Dict({
                 'observation': spaces.Box(
@@ -59,17 +58,20 @@ class RLBenchDvrkEnv(gym.Env):
             })
         elif observation_mode == 'vision':
             self.observation_space = spaces.Dict({
-                "state": spaces.Box(
+                # "state": spaces.Box(
+                #     low=-np.inf, high=np.inf,
+                #     shape=obs.get_low_dim_data().shape),
+                "robot_state": spaces.Box(
                     low=-np.inf, high=np.inf,
-                    shape=obs.get_low_dim_data().shape),
-                "left_shoulder_rgb": spaces.Box(
-                    low=0, high=1, shape=obs.left_shoulder_rgb.shape),
-                "right_shoulder_rgb": spaces.Box(
-                    low=0, high=1, shape=obs.right_shoulder_rgb.shape),
+                    shape=obs.robot_low_dim_data.shape),
+                # "left_shoulder_rgb": spaces.Box(
+                #     low=0, high=1, shape=obs.left_shoulder_rgb.shape),
+                # "right_shoulder_rgb": spaces.Box(
+                #     low=0, high=1, shape=obs.right_shoulder_rgb.shape),
                 "wrist_rgb": spaces.Box(
                     low=0, high=1, shape=obs.wrist_rgb.shape),
-                "front_rgb": spaces.Box(
-                    low=0, high=1, shape=obs.front_rgb.shape),
+                # "front_rgb": spaces.Box(
+                #     low=0, high=1, shape=obs.front_rgb.shape),
                 "wrist_mask": spaces.Box(
                     low=0, high=1, shape=obs.wrist_mask.shape),
                 'observation': spaces.Box(
@@ -89,12 +91,13 @@ class RLBenchDvrkEnv(gym.Env):
             cam_placeholder = Dummy('cam_cinematic_placeholder')
             self._gym_cam = VisionSensor.create([640, 360])
             self._gym_cam.set_pose(cam_placeholder.get_pose())
-            self._gym_cam_wrist = VisionSensor.create([360, 360])
-            self._gym_cam_wrist_placeholder = Dummy('cam_wrist_placeholder')
             if render_mode == 'human':
                 self._gym_cam.set_render_mode(RenderMode.OPENGL3_WINDOWED)
             else:
                 self._gym_cam.set_render_mode(RenderMode.OPENGL3)
+                self._gym_cam_wrist = VisionSensor.create([360, 360])
+                self._gym_cam_wrist_placeholder = Dummy('cam_wrist_placeholder')
+                self._gym_cam_wrist.set_render_mode(RenderMode.OPENGL3)
 
     def _extract_obs(self, obs) -> Dict[str, np.ndarray]:
         if self._observation_mode == 'state':
@@ -105,11 +108,12 @@ class RLBenchDvrkEnv(gym.Env):
             }
         elif self._observation_mode == 'vision':
             return {
-                "state": obs.get_low_dim_data(),
-                "left_shoulder_rgb": obs.left_shoulder_rgb,
-                "right_shoulder_rgb": obs.right_shoulder_rgb,
+                # "state": obs.get_low_dim_data(),
+                "robot_state": obs.robot_low_dim_data,
+                # "left_shoulder_rgb": obs.left_shoulder_rgb,
+                # "right_shoulder_rgb": obs.right_shoulder_rgb,
                 "wrist_rgb": obs.wrist_rgb,
-                "front_rgb": obs.front_rgb,
+                # "front_rgb": obs.front_rgb,
                 "wrist_mask": obs.wrist_mask,
                 "observation": obs.get_low_dim_data(),
                 "achieved_goal": obs.achieved_goal,
@@ -146,18 +150,16 @@ class RLBenchDvrkEnv(gym.Env):
             'is_success': self._is_success(obs.achieved_goal, obs.desired_goal),
         }
         reward = self.compute_reward(obs.achieved_goal, obs.desired_goal, info)
-        if reward != rew:
-            print("Goal Env Warning, condition reward: {}, distance reward: {}".format(rew, reward))
+        # if reward != rew:
+        #     print("Goal Env Warning, condition reward: {}, distance reward: {}".format(rew, reward))
 
         return self._extract_obs(obs), reward, False, info
 
     def close(self) -> None:
         self.env.shutdown()
 
-    def compute_reward(self, achieved_goal, desired_goal, info):
-        d = goal_distance(achieved_goal, desired_goal)
-        return -(d > self.distance_threshold).astype(np.float32)
+    def compute_reward(self, achieved_goal: np.ndarray, desired_goal: np.ndarray, info):
+        return self.task.compute_reward(achieved_goal, desired_goal, info)
 
-    def _is_success(self, achieved_goal, desired_goal):
-        d = goal_distance(achieved_goal, desired_goal)
-        return (d < self.distance_threshold).astype(np.float32)
+    def _is_success(self, achieved_goal: np.ndarray, desired_goal: np.ndarray):
+        return self.task.is_success(achieved_goal, desired_goal)
