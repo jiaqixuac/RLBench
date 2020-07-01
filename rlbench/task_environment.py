@@ -1,23 +1,20 @@
-from os import listdir
-from os.path import join, exists
-import pickle
+import logging
+from typing import List, Callable
+
 import numpy as np
-from PIL import Image
+from pyquaternion import Quaternion
 from pyrep import PyRep
 from pyrep.errors import IKError
+
+from rlbench import utils
+from rlbench.action_modes import ArmActionMode, ActionMode
 from rlbench.backend.exceptions import BoundaryError, WaypointError
+from rlbench.backend.observation import Observation
+from rlbench.backend.robot import Robot
 from rlbench.backend.scene import Scene
 from rlbench.backend.task import Task
-from rlbench.backend.const import *
-from rlbench.backend.utils import image_to_float_array, rgb_handles_to_mask
-from rlbench.backend.robot import Robot
-import logging
-from typing import List
-from rlbench.backend.observation import Observation
-from rlbench.action_modes import ArmActionMode, ActionMode
 from rlbench.demo import Demo
 from rlbench.observation_config import ObservationConfig
-from pyquaternion import Quaternion
 
 _TORQUE_MAX_VEL = 9999
 _DT = 0.05
@@ -128,20 +125,27 @@ class TaskEnvironment(object):
             raise InvalidActionError('Could not find a path.') from e
         done = False
         while not done:
-            self._pyrep.step()
+            self._scene.step()
             done = np.allclose(self._robot.arm.get_joint_positions(),
                                joint_positions, atol=0.01)
 
     def _path_action(self, action):
         self._assert_unit_quaternion(action[3:])
         try:
+
+            # Check if the target is in the workspace; if not, then quick reject
+            # Only checks position, not rotation
+            valid = self._scene.check_target_in_workspace(action[:3])
+            if not valid:
+                raise InvalidActionError('Target is outside of workspace.')
+
             path = self._robot.arm.get_path(
                 action[:3], quaternion=action[3:], ignore_collisions=True)
             done = False
             observations = []
             while not done:
                 done = path.step()
-                self._pyrep.step()
+                self._scene.step()
                 observations.append(self._scene.get_observation())
             return observations
         except IKError as e:
@@ -169,26 +173,12 @@ class TaskEnvironment(object):
         elif ee_action < 0.5:
             ee_action = 0.0
 
-        # If there is a gripper action, then we dont do an arm action
-        if current_ee != ee_action:
-            done = False
-            while not done:
-                done = self._robot.gripper.actuate(ee_action, velocity=0.2)
-                self._pyrep.step()
-                self._task.step()
-            if ee_action == 0.0:
-                # If gripper close action, the check for grasp.
-                for g_obj in self._task.get_graspable_objects():
-                    self._robot.gripper.grasp(g_obj)
-            else:
-                # If gripper open action, the check for ungrasp.
-                self._robot.gripper.release()
-
-        elif self._action_mode.arm == ArmActionMode.ABS_JOINT_VELOCITY:
+        if self._action_mode.arm == ArmActionMode.ABS_JOINT_VELOCITY:
 
             self._assert_action_space(arm_action,
                                       (len(self._robot.arm.joints),))
             self._robot.arm.set_joint_target_velocities(arm_action)
+            self._scene.step()
 
         elif self._action_mode.arm == ArmActionMode.DELTA_JOINT_VELOCITY:
 
@@ -196,12 +186,14 @@ class TaskEnvironment(object):
                                       (len(self._robot.arm.joints),))
             cur = np.array(self._robot.arm.get_joint_velocities())
             self._robot.arm.set_joint_target_velocities(cur + arm_action)
+            self._scene.step()
 
         elif self._action_mode.arm == ArmActionMode.ABS_JOINT_POSITION:
 
             self._assert_action_space(arm_action,
                                       (len(self._robot.arm.joints),))
             self._robot.arm.set_joint_target_positions(arm_action)
+            self._scene.step()
 
         elif self._action_mode.arm == ArmActionMode.DELTA_JOINT_POSITION:
 
@@ -209,6 +201,7 @@ class TaskEnvironment(object):
                                       (len(self._robot.arm.joints),))
             cur = np.array(self._robot.arm.get_joint_positions())
             self._robot.arm.set_joint_target_positions(cur + arm_action)
+            self._scene.step()
 
         elif self._action_mode.arm == ArmActionMode.ABS_EE_POSE:
 
@@ -267,17 +260,32 @@ class TaskEnvironment(object):
             self._assert_action_space(
                 arm_action, (len(self._robot.arm.joints),))
             self._torque_action(arm_action)
+            self._scene.step()
 
         elif self._action_mode.arm == ArmActionMode.DELTA_JOINT_TORQUE:
 
             cur = np.array(self._robot.arm.get_joint_forces())
             new_action = cur + arm_action
             self._torque_action(new_action)
+            self._scene.step()
 
         else:
             raise RuntimeError('Unrecognised action mode.')
 
-        self._scene.step()
+        if current_ee != ee_action:
+            done = False
+            while not done:
+                done = self._robot.gripper.actuate(ee_action, velocity=0.2)
+                self._pyrep.step()
+                self._task.step()
+            if ee_action == 0.0:
+                # If gripper close action, the check for grasp.
+                for g_obj in self._task.get_graspable_objects():
+                    self._robot.gripper.grasp(g_obj)
+            else:
+                # If gripper open action, the check for ungrasp.
+                self._robot.gripper.release()
+
         success, terminate = self._task.success()
         return self._scene.get_observation(), int(success), terminate
 
@@ -288,8 +296,11 @@ class TaskEnvironment(object):
                                'ABS_EE_POSE_PLAN action mode.')
         return self._path_observations
 
-    def get_demos(self, amount: int, live_demos=False,
-                  image_paths=True) -> List[Demo]:
+    def get_demos(self, amount: int, live_demos: bool = False,
+                  image_paths: bool = False,
+                  callable_each_step: Callable[[Observation], None] = None,
+                  max_attempts: int = _MAX_DEMO_ATTEMPTS,
+                  ) -> List[Demo]:
         """Negative means all demos"""
 
         if not live_demos and (self._dataset_root is None
@@ -301,24 +312,31 @@ class TaskEnvironment(object):
             if self._dataset_root is None or len(self._dataset_root) == 0:
                 raise RuntimeError(
                     "Can't ask for stored demo when no dataset root provided.")
-            demos = self._get_stored_demos(amount, image_paths)
+            demos = utils.get_stored_demos(
+                amount, image_paths, self._dataset_root, self._variation_number,
+                self._task.get_name(), self._obs_config)
         else:
             ctr_loop = self._robot.arm.joints[0].is_control_loop_enabled()
             self._robot.arm.joints[0].set_control_loop_enabled(True)
-            demos = self._get_live_demos(amount)
+            demos = self._get_live_demos(
+                amount, callable_each_step, max_attempts)
             self._robot.arm.joints[0].set_control_loop_enabled(ctr_loop)
         return demos
 
-    def _get_live_demos(self, amount) -> List[Demo]:
+    def _get_live_demos(self, amount: int,
+                        callable_each_step: Callable[
+                            [Observation], None] = None,
+                        max_attempts: int = _MAX_DEMO_ATTEMPTS) -> List[Demo]:
         demos = []
         for i in range(amount):
-            attempts = _MAX_DEMO_ATTEMPTS
+            attempts = max_attempts
             while attempts > 0:
                 random_seed = np.random.get_state()
                 self.reset()
                 logging.info('Collecting demo %d' % i)
                 try:
-                    demo = self._scene.get_demo()
+                    demo = self._scene.get_demo(
+                        callable_each_step=callable_each_step)
                     demo.random_seed = random_seed
                     demos.append(demo)
                     break
@@ -328,181 +346,6 @@ class TaskEnvironment(object):
             if attempts <= 0:
                 raise RuntimeError(
                     'Could not collect demos. Maybe a problem with the task?')
-        return demos
-
-    def _resize_if_needed(self, image, size):
-        if image.size[0] != size[0] or image.size[1] != size[1]:
-            image = image.resize(size)
-        return image
-
-    def _get_stored_demos(self, amount: int, image_paths: bool) -> List[Demo]:
-
-        task_root = join(self._dataset_root, self._task.get_name())
-        if not exists(task_root):
-            raise RuntimeError("Can't find the demos for %s at: %s" % (
-                self._task.get_name(), task_root))
-
-        # Sample an amount of examples for the variation of this task
-        examples_path = join(
-            task_root, VARIATIONS_FOLDER % self._variation_number,
-            EPISODES_FOLDER)
-        examples = listdir(examples_path)
-        if amount == -1:
-            amount = len(examples)
-        if amount > len(examples):
-            raise RuntimeError(
-                'You asked for %d examples, but only %d were available.' % (
-                    amount, len(examples)))
-        selected_examples = np.random.choice(examples, amount, replace=False)
-
-        obs_config = self._obs_config
-
-        # Process these examples (e.g. loading observations)
-        demos = []
-        for example in selected_examples:
-            example_path = join(examples_path, example)
-            with open(join(example_path, LOW_DIM_PICKLE), 'rb') as f:
-                obs = pickle.load(f)
-
-            l_sh_rgb_f = join(example_path, LEFT_SHOULDER_RGB_FOLDER)
-            l_sh_depth_f = join(example_path, LEFT_SHOULDER_DEPTH_FOLDER)
-            l_sh_mask_f = join(example_path, LEFT_SHOULDER_MASK_FOLDER)
-            r_sh_rgb_f = join(example_path, RIGHT_SHOULDER_RGB_FOLDER)
-            r_sh_depth_f = join(example_path, RIGHT_SHOULDER_DEPTH_FOLDER)
-            r_sh_mask_f = join(example_path, RIGHT_SHOULDER_MASK_FOLDER)
-            wrist_rgb_f = join(example_path, WRIST_RGB_FOLDER)
-            wrist_depth_f = join(example_path, WRIST_DEPTH_FOLDER)
-            wrist_mask_f = join(example_path, WRIST_MASK_FOLDER)
-            front_rgb_f = join(example_path, FRONT_RGB_FOLDER)
-            front_depth_f = join(example_path, FRONT_DEPTH_FOLDER)
-            front_mask_f = join(example_path, FRONT_MASK_FOLDER)
-
-            num_steps = len(obs)
-
-            if not (num_steps == len(listdir(l_sh_rgb_f)) == len(
-                    listdir(l_sh_depth_f)) == len(listdir(r_sh_rgb_f)) == len(
-                    listdir(r_sh_depth_f)) == len(listdir(wrist_rgb_f)) == len(
-                    listdir(wrist_depth_f)) == len(listdir(front_rgb_f)) == len(
-                    listdir(front_depth_f))):
-                raise RuntimeError('Broken dataset assumption')
-
-            for i in range(num_steps):
-                si = IMAGE_FORMAT % i
-                if obs_config.left_shoulder_camera.rgb:
-                    obs[i].left_shoulder_rgb = join(l_sh_rgb_f, si)
-                if obs_config.left_shoulder_camera.depth:
-                    obs[i].left_shoulder_depth = join(l_sh_depth_f, si)
-                if obs_config.left_shoulder_camera.mask:
-                    obs[i].left_shoulder_mask = join(l_sh_mask_f, si)
-                if obs_config.right_shoulder_camera.rgb:
-                    obs[i].right_shoulder_rgb = join(r_sh_rgb_f, si)
-                if obs_config.right_shoulder_camera.depth:
-                    obs[i].right_shoulder_depth = join(r_sh_depth_f, si)
-                if obs_config.right_shoulder_camera.mask:
-                    obs[i].right_shoulder_mask = join(r_sh_mask_f, si)
-                if obs_config.wrist_camera.rgb:
-                    obs[i].wrist_rgb = join(wrist_rgb_f, si)
-                if obs_config.wrist_camera.depth:
-                    obs[i].wrist_depth = join(wrist_depth_f, si)
-                if obs_config.wrist_camera.mask:
-                    obs[i].wrist_mask = join(wrist_mask_f, si)
-                if obs_config.front_camera.rgb:
-                    obs[i].front_rgb = join(front_rgb_f, si)
-                if obs_config.front_camera.depth:
-                    obs[i].front_depth = join(front_depth_f, si)
-                if obs_config.front_camera.mask:
-                    obs[i].front_mask = join(front_mask_f, si)
-
-                # Remove low dim info if necessary
-                if not obs_config.joint_velocities:
-                    obs[i].joint_velocities = None
-                if not obs_config.joint_positions:
-                    obs[i].joint_positions = None
-                if not obs_config.joint_forces:
-                    obs[i].joint_forces = None
-                if not obs_config.gripper_open_amount:
-                    obs[i].gripper_open_amount = None
-                if not obs_config.gripper_pose:
-                    obs[i].gripper_pose = None
-                if not obs_config.gripper_joint_positions:
-                    obs[i].gripper_joint_positions = None
-                if not obs_config.gripper_touch_forces:
-                    obs[i].gripper_touch_forces = None
-                if not obs_config.task_low_dim_state:
-                    obs[i].task_low_dim_state = None
-
-            if not image_paths:
-                for i in range(num_steps):
-                    if obs_config.left_shoulder_camera.rgb:
-                        obs[i].left_shoulder_rgb = np.array(
-                            self._resize_if_needed(
-                                Image.open(obs[i].left_shoulder_rgb),
-                                obs_config.left_shoulder_camera.image_size))
-                    if obs_config.right_shoulder_camera.rgb:
-                        obs[i].right_shoulder_rgb = np.array(
-                            self._resize_if_needed(Image.open(
-                            obs[i].right_shoulder_rgb),
-                                obs_config.right_shoulder_camera.image_size))
-                    if obs_config.wrist_camera.rgb:
-                        obs[i].wrist_rgb = np.array(
-                            self._resize_if_needed(
-                                Image.open(obs[i].wrist_rgb),
-                                obs_config.wrist_camera.image_size))
-                    if obs_config.front_camera.rgb:
-                        obs[i].front_rgb = np.array(
-                            self._resize_if_needed(
-                                Image.open(obs[i].front_rgb),
-                                obs_config.front_camera.image_size))
-
-                    if obs_config.left_shoulder_camera.depth:
-                        obs[i].left_shoulder_depth = image_to_float_array(
-                            self._resize_if_needed(
-                                Image.open(obs[i].left_shoulder_depth),
-                                obs_config.left_shoulder_camera.image_size),
-                            DEPTH_SCALE)
-                    if obs_config.right_shoulder_camera.depth:
-                        obs[i].right_shoulder_depth = image_to_float_array(
-                            self._resize_if_needed(
-                                Image.open(obs[i].right_shoulder_depth),
-                                obs_config.right_shoulder_camera.image_size),
-                            DEPTH_SCALE)
-                    if obs_config.wrist_camera.depth:
-                        obs[i].wrist_depth = image_to_float_array(
-                            self._resize_if_needed(
-                                Image.open(obs[i].wrist_depth),
-                                obs_config.wrist_camera.image_size),
-                            DEPTH_SCALE)
-                    if obs_config.front_camera.depth:
-                        obs[i].front_depth = image_to_float_array(
-                            self._resize_if_needed(
-                                Image.open(obs[i].front_depth),
-                                obs_config.front_camera.image_size),
-                            DEPTH_SCALE)
-
-                    # Masks are stored as coded RGB images.
-                    # Here we transform them into 1 channel handles.
-                    if obs_config.left_shoulder_camera.mask:
-                        obs[i].left_shoulder_mask = rgb_handles_to_mask(
-                            np.array(self._resize_if_needed(Image.open(
-                                obs[i].left_shoulder_mask),
-                                obs_config.left_shoulder_camera.image_size)))
-                    if obs_config.right_shoulder_camera.mask:
-                        obs[i].right_shoulder_mask = rgb_handles_to_mask(
-                            np.array(self._resize_if_needed(Image.open(
-                                obs[i].right_shoulder_mask),
-                                obs_config.right_shoulder_camera.image_size)))
-                    if obs_config.wrist_camera.mask:
-                        obs[i].wrist_mask = rgb_handles_to_mask(np.array(
-                            self._resize_if_needed(Image.open(
-                                obs[i].wrist_mask),
-                                obs_config.wrist_camera.image_size)))
-                    if obs_config.front_camera.mask:
-                        obs[i].front_mask = rgb_handles_to_mask(np.array(
-                            self._resize_if_needed(Image.open(
-                                obs[i].front_mask),
-                                obs_config.front_camera.image_size)))
-
-            demos.append(obs)
         return demos
 
     def reset_to_demo(self, demo: Demo) -> None:

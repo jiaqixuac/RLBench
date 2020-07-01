@@ -34,6 +34,8 @@ flags.DEFINE_integer('processes', 1,
                      'The number of parallel processes during collection.')
 flags.DEFINE_integer('episodes_per_task', 10,
                      'The number of episodes to collect per task.')
+flags.DEFINE_integer('variations', -1,
+                     'Number of variations to collect per task. -1 for all.')
 
 
 def check_and_make(dir):
@@ -79,24 +81,24 @@ def save_demo(demo, example_path):
     for i, obs in enumerate(demo):
         left_shoulder_rgb = Image.fromarray(
             (obs.left_shoulder_rgb * 255).astype(np.uint8))
-        left_shoulder_depth = utils.float_array_to_grayscale_image(
+        left_shoulder_depth = utils.float_array_to_rgb_image(
             obs.left_shoulder_depth, scale_factor=DEPTH_SCALE)
         left_shoulder_mask = Image.fromarray(
             (obs.left_shoulder_mask * 255).astype(np.uint8))
         right_shoulder_rgb = Image.fromarray(
             (obs.right_shoulder_rgb * 255).astype(np.uint8))
-        right_shoulder_depth = utils.float_array_to_grayscale_image(
+        right_shoulder_depth = utils.float_array_to_rgb_image(
             obs.right_shoulder_depth, scale_factor=DEPTH_SCALE)
         right_shoulder_mask = Image.fromarray(
             (obs.right_shoulder_mask * 255).astype(np.uint8))
 
         wrist_rgb = Image.fromarray((obs.wrist_rgb * 255).astype(np.uint8))
-        wrist_depth = utils.float_array_to_grayscale_image(
+        wrist_depth = utils.float_array_to_rgb_image(
             obs.wrist_depth, scale_factor=DEPTH_SCALE)
         wrist_mask = Image.fromarray((obs.wrist_mask * 255).astype(np.uint8))
 
         front_rgb = Image.fromarray((obs.front_rgb * 255).astype(np.uint8))
-        front_depth = utils.float_array_to_grayscale_image(
+        front_depth = utils.float_array_to_rgb_image(
             obs.front_depth, scale_factor=DEPTH_SCALE)
         front_mask = Image.fromarray((obs.front_mask * 255).astype(np.uint8))
 
@@ -163,7 +165,7 @@ def run(i, lock, task_index, variation_count, results, file_lock, tasks):
     if FLAGS.renderer == 'opengl':
         obs_config.right_shoulder_camera.render_mode = RenderMode.OPENGL
         obs_config.left_shoulder_camera.render_mode = RenderMode.OPENGL
-        obs_config.left_shoulder_camera.render_mode = RenderMode.OPENGL
+        obs_config.wrist_camera.render_mode = RenderMode.OPENGL
         obs_config.front_camera.render_mode = RenderMode.OPENGL
 
     rlbench_env = Environment(
@@ -187,7 +189,10 @@ def run(i, lock, task_index, variation_count, results, file_lock, tasks):
             my_variation_count = variation_count.value
             t = tasks[task_index.value]
             task_env = rlbench_env.get_task(t)
-            if my_variation_count >= task_env.variation_count():
+            var_target = task_env.variation_count()
+            if FLAGS.variations >= 0:
+                var_target = np.minimum(FLAGS.variations, var_target)
+            if my_variation_count >= var_target:
                 # If we have reached the required number of variations for this
                 # task, then move on to the next task.
                 variation_count.value = my_variation_count = 0
@@ -250,7 +255,6 @@ def run(i, lock, task_index, variation_count, results, file_lock, tasks):
                 break
 
     results[i] = tasks_with_problems
-
     rlbench_env.shutdown()
 
 
